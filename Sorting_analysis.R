@@ -1,272 +1,263 @@
 ############################################################
-#  Detecting Duplicate Survey Questions with MiniLM Embeddings
-#  ----------------------------------------------------------
-#  This script finds near-duplicate survey questions by:
-#    - Cleaning question texts
-#    - Generating transformer embeddings
-#    - Calculating pairwise similarities
-#    - Reporting highly similar pairs
-#    - (Optionally) Clustering questions by similarity
+#    Survey Question Deduplication – Interactive Workflow  #
 ############################################################
 
-# Script author: luciek@spc.int
-# Created: June 2025
-# Last edited: 6 June 2025
-
-# User settings -----------------------------------------------------------
-rm(list = ls())
-setwd("C:/Users/luciek/My Documents/Knowledge/Indicators/Analysis/")
-
-# File and column info
-file_path         <- "C:/Users/luciek/Documents/Knowledge/Indicators/052025_indicators.xlsx"   # Excel file
-excel_sheet       <- 1                        # Sheet number or name
-question_col_name <- "Indicator"              # Name of column with questions
-similarity_cutoff <- 0.90                     # Cosine similarity threshold for "duplicates"
-min_cluster_size  <- 1                        # Minimum cluster size (optional clustering)
-
-# Needed packages ---------------------------------------------------------
-# Set Java paths (required on some systems)
-Sys.setenv(JAVA_HOME = "C:/Users/luciek/AppData/Local/Programs/Eclipse Adoptium/jdk-17.0.15.6-hotspot")
-Sys.setenv(PATH = paste(Sys.getenv("PATH"),
-                        "C:/Users/luciek/AppData/Local/Programs/Eclipse Adoptium/jdk-17.0.15.6-hotspot/bin",
-                        "C:/Users/luciek/AppData/Local/Programs/Eclipse Adoptium/jdk-17.0.15.6-hotspot/bin/server",
-                        sep = ";"))
-
-# Load R packages and set up Python/Java (required for transformer models)
-library(readxl)
-library(rJava)
-library(reticulate)
-library(text)
-library(future.apply)
-
-# Set Python paths (required on some systems)
-Sys.setenv(JAVA_HOME = "C:/Users/luciek/AppData/Local/Programs/Eclipse Adoptium/jdk-17.0.15.6-hotspot")
-Sys.setenv(PATH = paste(Sys.getenv("PATH"),
-                        "C:/Users/luciek/AppData/Local/Programs/Eclipse Adoptium/jdk-17.0.15.6-hotspot/bin",
-                        "C:/Users/luciek/AppData/Local/Programs/Eclipse Adoptium/jdk-17.0.15.6-hotspot/bin/server",
-                        sep = ";"))
-use_python("C:/Users/luciek/AppData/Local/Programs/Python/Python311/python.exe", required = TRUE)
-
-# Download necessary NLTK data for Python (needed by {text})
-py_run_string("
-import nltk
-nltk.download('punkt')
-nltk.download('averaged_perceptron_tagger')
-nltk.download('wordnet')
-nltk.download('omw-1.4')
-nltk.download('maxent_ne_chunker')
-nltk.download('words')
-")
-
-Sys.unsetenv("https_proxy")
-Sys.unsetenv("http_proxy")
-
-# Load data ---------------------------------------------------------------
-# Read questions from Excel file
-survey_df <- as.data.frame(readxl::read_excel(file_path, sheet = excel_sheet))
-if (! question_col_name %in% names(survey_df)) {
-  stop(paste("Column", question_col_name, "not found in the spreadsheet"))
-}
-raw_questions <- as.character(survey_df[[question_col_name]])
-question_ids  <- seq_along(raw_questions)  # For unique indexing
-
-# Clean question text -----------------------------------------------------
-# Standardise and simplify questions for better duplicate detection
+  # User settings -----------------------------------------------------------
+  # Remove all objects from the current R session (start with a clean workspace)
+  rm(list = ls())
+  
+  # Set the working directory for file read/write operations
+  setwd("C:/Users/luciek/My Documents/Knowledge/Indicators/Analysis/")
+  
+  # File and Data Column Settings
+  file_path         <- "C:/Users/luciek/Documents/Knowledge/Indicators/052025_indicators.xlsx"  # Path to the Excel file containing your questions
+  excel_sheet       <- 1                # Sheet index or name to load (1 = first sheet)
+  question_col      <- "Indicator"      # Column name in the Excel file containing the survey questions
+  
+  # Deduplication & Clustering Parameters
+  similarity_start   <- 0.90            # Starting threshold for cosine similarity (higher = stricter, lower = more matches)
+  max_rounds         <- 10              # Maximum number of deduplication rounds (to avoid infinite loops)
+  min_cluster_size   <- 1               # Minimum size for a question cluster (rarely changed)
+  
+  # Manual Review Tag
+  false_positive_tag <- "FP"            # Value used to tag clusters as false positives (for later reprocessing)
+  
+  # Framework list
+  frameworks <- c(
+    "Blue_pacific", "BRS_convention", "CBD", "FDES", "Global_set", "FGS", "HH_survey",
+    "Migratory_fish_convention_Pacific", "Minamata_convention", "Montreal_protocol",
+    "Noumea_convention", "PIRT", "Ramsar", "Regional_goal", "Rotterdam_convention",
+    "Samoa_pathway", "SDG", "Sendai", "SPREP", "Stockholm_convention",
+    "UN_fish", "UNCCD", "UNFCCC", "Underwater_cultural_heritage_convention", "Waigani_convention"
+  )
+  
+  # Required Libraries
+  library(readxl)
+  library(text)
+  library(future.apply)
+  
+  Sys.setenv(JAVA_HOME = "C:/Users/luciek/AppData/Local/Programs/Eclipse Adoptium/jdk-17.0.15.6-hotspot")
+  Sys.setenv(PATH = paste(Sys.getenv("PATH"),
+                          "C:/Users/luciek/AppData/Local/Programs/Eclipse Adoptium/jdk-17.0.15.6-hotspot/bin",
+                          "C:/Users/luciek/AppData/Local/Programs/Eclipse Adoptium/jdk-17.0.15.6-hotspot/bin/server",
+                          sep = ";"))
+  library(rJava)
+  
+  library(reticulate)
+  use_python("C:/Users/luciek/AppData/Local/Programs/Python/Python311/python.exe", required = TRUE)
+  py_run_string("
+  import nltk
+  nltk.download('punkt')
+  nltk.download('averaged_perceptron_tagger')
+  nltk.download('wordnet')
+  nltk.download('omw-1.4')
+  nltk.download('maxent_ne_chunker')
+  nltk.download('words')
+  ")
+  
+  Sys.unsetenv("https_proxy")
+  Sys.unsetenv("http_proxy")
+  
+  
+# Functions ---------------------------------------------------------------
+# -- Clean Questions --
 clean_question <- function(txt) {
   txt <- tolower(txt)
-  # Remove enumeration (e.g. "1.", "(a)", etc.)
-  txt <- gsub("^\\s*\\(?[0-9a-z]+(?:[\\.-][0-9a-z]+)*[\\.)-]?\\s+", "", txt, perl = TRUE)
-  # Remove punctuation and extra spaces
-  txt <- gsub("[[:punct:]]+", " ", txt)
+  tokens <- strsplit(txt, "\\s+")[[1]]
+  if (length(tokens) > 1 && grepl("\\d", tokens[1])) tokens <- tokens[-1]
+  txt <- paste(tokens, collapse = " ")
+  txt <- gsub("[^a-z0-9% ]", " ", txt)
   txt <- gsub("[[:space:]]+", " ", txt)
   trimws(txt)
 }
-questions_clean <- vapply(raw_questions, clean_question, character(1))
 
-# Create transformer embeddings -------------------------------------------
-# Use MiniLM model to create a vector representation for each question
-plan(multisession, workers = max(1, parallel::detectCores() - 4))
-embeddings_obj <- textEmbed(
-  questions_clean,
-  model = "C:/Users/luciek/all-MiniLM-L6-v2",  # Path to downloaded MiniLM model
-  aggregation_from_tokens_to_texts = "mean",
-  batch_size = 128,
-  via_parallel = TRUE,
-  max_processes = future::nbrOfWorkers()
-)
-embeddings_matrix <- as.data.frame(embeddings_obj$texts)
-embeddings_matrix <- apply(as.matrix(embeddings_matrix), 2, as.numeric)
-
-# Optionally save to disk:
-# saveRDS(embeddings_matrix, "question_embeddings.rds")
-
-
-# Quantify similarity in phrasing -----------------------------------------
-# Compare all questions to find pairs that are highly similar
-row_norms <- sqrt(rowSums(embeddings_matrix^2))
-embeddings_normalized <- embeddings_matrix / row_norms
-similarity_matrix <- tcrossprod(embeddings_normalized)  # [n x n] similarity for all pairs
-
-# Extract pairs of questions that are above the similarity threshold
-pair_indices <- which(similarity_matrix > similarity_cutoff & upper.tri(similarity_matrix), arr.ind = TRUE)
-
-if (nrow(pair_indices) == 0) {
-  cat("No pairs exceed similarity threshold", similarity_cutoff, "\n")
-} else {
-  duplicates_df <- data.frame(
-    question_id_1 = question_ids[pair_indices[, 1]],
-    question_id_2 = question_ids[pair_indices[, 2]],
-    similarity    = similarity_matrix[pair_indices],
-    question_1    = raw_questions[pair_indices[, 1]],
-    question_2    = raw_questions[pair_indices[, 2]],
-    stringsAsFactors = FALSE
+# -- Embedding & Similarity --
+embed_and_sim <- function(questions_clean) {
+  plan(multisession, workers = max(1, parallel::detectCores() - 4))
+  emb_obj <- textEmbed(
+    questions_clean,
+    model = "C:/Users/luciek/all-MiniLM-L6-v2",
+    aggregation_from_tokens_to_texts = "mean",
+    batch_size = 128,
+    via_parallel = TRUE,
+    max_processes = future::nbrOfWorkers()
   )
-  duplicates_df <- duplicates_df[order(-duplicates_df$similarity), ]  # Most similar pairs first
-  write.csv(duplicates_df, "duplicate_pairs.csv", row.names = FALSE)
-  cat(nrow(duplicates_df), "likely duplicate pairs written to duplicate_pairs.csv\n")
+  emb_mat <- as.data.frame(emb_obj$texts)
+  emb_mat <- apply(as.matrix(emb_mat), 2, as.numeric)
+  norms <- sqrt(rowSums(emb_mat^2))
+  emb_n <- emb_mat / norms
+  sim_mat <- tcrossprod(emb_n)
+  return(sim_mat)
 }
 
-# Create clusters ---------------------------------------------------------
-# Group questions into clusters based on their similarity
-if (nrow(embeddings_matrix) >= min_cluster_size) {
-  cat("Clustering questions by similarity…\n")
-  question_dist <- as.dist(1 - similarity_matrix)         # Convert similarity to distance
-  hclust_obj    <- stats::hclust(question_dist, method = "average")
-  question_clusters <- stats::cutree(hclust_obj, h = 1 - similarity_cutoff)
-  cluster_table <- data.frame(
-    cluster  = question_clusters,
-    question = raw_questions,
-    stringsAsFactors = FALSE
-  )
-  write.csv(cluster_table, "duplicate_clusters.csv", row.names = FALSE)
-  cat("Cluster assignments written to duplicate_clusters.csv\n")
-}
-
-# Optionally, add cluster labels to main survey data and export
-survey_with_clusters <- merge(survey_df, cluster_table, by.x = 'Indicator', by.y = 'question', all.x = TRUE)
-survey_with_clusters <- survey_with_clusters[order(survey_with_clusters$cluster), ]
-
-# Clean up question text in the survey data with cluster info
-survey_with_clusters$Indicator <- vapply(survey_with_clusters$Indicator, clean_question, character(1))
-
-
-# Summarize clusters ------------------------------------------------------
-# This function summarises topics and frameworks for each cluster.
-summarise_cluster_frameworks <- function(cluster_df) {
-  # --- Identify unique frameworks in the cluster ---
+# -- Frameworks Extraction for Each Cluster --
+get_frameworks <- function(cluster_df, frameworks) {
   frameworks_in_cluster <- unique(na.omit(
     c(cluster_df[, "Source"], cluster_df[, "Link(s) w other frameworks"])
   ))
-  
-  # --- Summarise topics, subtopics, and frameworks ---
-  if (nrow(cluster_df) == 1) {
-    cluster_summary <- data.frame(
-      Topic1 = cluster_df[, "Climate change topic"], 
-      subtopic1 = cluster_df[, "Subtopic"],
-      Topic2 = NA, subtopic2 = NA, 
-      Topic3 = NA, subtopic3 = NA,
-      Indicator = cluster_df[, "Indicator"],
-      details = NA,
-      Blue_pacific = any(grepl("Bluepacific", frameworks_in_cluster, ignore.case = TRUE)),
-      BRS_convention = any(grepl("BRS", frameworks_in_cluster, ignore.case = TRUE)),
-      CBD = any(grepl("CBD", frameworks_in_cluster, ignore.case = TRUE)),
-      FDES = any(grepl("FDES", frameworks_in_cluster, ignore.case = TRUE)),
-      Global_set = any(c(
-        grepl("FGS", frameworks_in_cluster, ignore.case = TRUE),
-        grepl("Global_set", frameworks_in_cluster, ignore.case = TRUE)
-      )),
-      HH_survey = any(grepl("HH_survey", frameworks_in_cluster, ignore.case = TRUE)),
-      Migratory_fish_convention_Pacific = any(grepl("migratory fish", frameworks_in_cluster, ignore.case = TRUE)),
-      Minamata_convention = any(grepl("Minamata", frameworks_in_cluster, ignore.case = TRUE)),
-      Montreal_protocol = any(grepl("Montreal", frameworks_in_cluster, ignore.case = TRUE)),
-      Noumea_convention = any(grepl("Noumea", frameworks_in_cluster, ignore.case = TRUE)),
-      PIRT = any(grepl("PIRT", frameworks_in_cluster, ignore.case = TRUE)),
-      Ramsar = any(grepl("Ramsar", frameworks_in_cluster, ignore.case = TRUE)),
-      Regional_goal = any(grepl("regional goal", frameworks_in_cluster, ignore.case = TRUE)),
-      Rotterdam_convention = any(grepl("Rotterdam", frameworks_in_cluster, ignore.case = TRUE)),
-      Samoa_pathway = any(grepl("Samoa", frameworks_in_cluster, ignore.case = TRUE)),
-      SDG = any(grepl("SDG", frameworks_in_cluster, ignore.case = TRUE)),
-      Sendai = any(grepl("Sendai", frameworks_in_cluster, ignore.case = TRUE)),
-      SPREP = any(grepl("SPREP", frameworks_in_cluster, ignore.case = TRUE)),
-      Stockholm_convention = any(grepl("Stockholm", frameworks_in_cluster, ignore.case = TRUE)),
-      UN_fish = any(grepl("UN fish stocks", frameworks_in_cluster, ignore.case = TRUE)),
-      UNCCD = any(grepl("UNCCD", frameworks_in_cluster, ignore.case = TRUE)),
-      UNFCCC = any(grepl("UNFCCC", frameworks_in_cluster, ignore.case = TRUE)),
-      Underwater_cultural_heritage_convention = any(grepl("underwater cultural heritage", frameworks_in_cluster, ignore.case = TRUE)),
-      Waigani_convention = any(grepl("Waigani", frameworks_in_cluster, ignore.case = TRUE)),
-      data_needs = cluster_df[, "Data needs"],
-      data_sources = cluster_df[, "Data sources"]
-    )
-  } else {
-    top_topics <- names(sort(table(cluster_df[, "Climate change topic"]), decreasing = TRUE))[1:3]
-    top_subtopics <- vector("list", 3)
-    for (i in 1:3) {
-      if (!is.na(top_topics[i])) {
-        top_subtopics[[i]] <- names(sort(
-          table(cluster_df[cluster_df[, "Climate change topic"] == top_topics[i], "Subtopic"]),
-          decreasing = TRUE
-        ))[1]
-      } else {
-        top_subtopics[[i]] <- NA
-      }
-    }
-    print(sort(cluster_df[, "Indicator"]))
-    user_indicator <- readline(prompt = "Please enter the new 'global' indicator: ")
-    cluster_summary <- data.frame(
-      Topic1 = top_topics[1], 
-      subtopic1 = top_subtopics[[1]],
-      Topic2 = top_topics[2], 
-      subtopic2 = top_subtopics[[2]],
-      Topic3 = top_topics[3], 
-      subtopic3 = top_subtopics[[3]],
-      Indicator = user_indicator,
-      details = cluster_df[, "Indicator"],
-      Blue_pacific = any(grepl("Bluepacific", frameworks_in_cluster, ignore.case = TRUE)),
-      BRS_convention = any(grepl("BRS", frameworks_in_cluster, ignore.case = TRUE)),
-      CBD = any(grepl("CBD", frameworks_in_cluster, ignore.case = TRUE)),
-      FDES = any(grepl("FDES", frameworks_in_cluster, ignore.case = TRUE)),
-      Global_set = any(c(
-        grepl("FGS", frameworks_in_cluster, ignore.case = TRUE),
-        grepl("Global_set", frameworks_in_cluster, ignore.case = TRUE)
-      )),
-      HH_survey = any(grepl("HH_survey", frameworks_in_cluster, ignore.case = TRUE)),
-      Migratory_fish_convention_Pacific = any(grepl("migratory fish", frameworks_in_cluster, ignore.case = TRUE)),
-      Minamata_convention = any(grepl("Minamata", frameworks_in_cluster, ignore.case = TRUE)),
-      Montreal_protocol = any(grepl("Montreal", frameworks_in_cluster, ignore.case = TRUE)),
-      Noumea_convention = any(grepl("Noumea", frameworks_in_cluster, ignore.case = TRUE)),
-      PIRT = any(grepl("PIRT", frameworks_in_cluster, ignore.case = TRUE)),
-      Ramsar = any(grepl("Ramsar", frameworks_in_cluster, ignore.case = TRUE)),
-      Regional_goal = any(grepl("regional goal", frameworks_in_cluster, ignore.case = TRUE)),
-      Rotterdam_convention = any(grepl("Rotterdam", frameworks_in_cluster, ignore.case = TRUE)),
-      Samoa_pathway = any(grepl("Samoa", frameworks_in_cluster, ignore.case = TRUE)),
-      SDG = any(grepl("SDG", frameworks_in_cluster, ignore.case = TRUE)),
-      Sendai = any(grepl("Sendai", frameworks_in_cluster, ignore.case = TRUE)),
-      SPREP = any(grepl("SPREP", frameworks_in_cluster, ignore.case = TRUE)),
-      Stockholm_convention = any(grepl("Stockholm", frameworks_in_cluster, ignore.case = TRUE)),
-      UN_fish = any(grepl("UN fish stocks", frameworks_in_cluster, ignore.case = TRUE)),
-      UNCCD = any(grepl("UNCCD", frameworks_in_cluster, ignore.case = TRUE)),
-      UNFCCC = any(grepl("UNFCCC", frameworks_in_cluster, ignore.case = TRUE)),
-      Underwater_cultural_heritage_convention = any(grepl("underwater cultural heritage", frameworks_in_cluster, ignore.case = TRUE)),
-      Waigani_convention = any(grepl("Waigani", frameworks_in_cluster, ignore.case = TRUE)),
-      data_needs = paste(unique(cluster_df[, "Data needs"]), collapse = "; "),
-      data_sources = paste(unique(cluster_df[, "Data sources"]), collapse = "; ")
-    )
-  }
-  return(cluster_summary)
+  sapply(frameworks, function(fw) {
+    any(grepl(gsub("_", " ", fw), frameworks_in_cluster, ignore.case = TRUE))
+  })
 }
 
-# Number of clusters requiring manual input
-sum(table(table(cluster_table$cluster))[-1])
+# -- Main Interactive Deduplication Loop --
+#' Interactive Deduplication and Clustering of Survey Questions
+#'
+#' This function iteratively groups similar survey questions (indicators) into clusters,
+#' prompts the user to review each cluster, and allows interactive assignment of new "global" indicators
+#' or flagging of clusters as false positives. The workflow continues until all clusters are resolved
+#' or the maximum number of rounds is reached. Each round, flagged clusters are reclustered at a stricter threshold.
+#'
+#' @param raw_df            The raw data.frame with indicator questions and associated info.
+#' @param frameworks        A vector of framework names to scan for (used for output columns).
+#' @param question_col      Column name in raw_df containing the question text.
+#' @param similarity_start  Initial similarity threshold (e.g., 0.90).
+#' @param min_cluster_size  Minimum cluster size to retain (typically 1).
+#' @param max_rounds        Maximum number of reclustering rounds (default 10).
+#' @param false_positive_tag String to use for clusters flagged as "not a real cluster" (e.g., "FP").
+#'
+#' @return data.frame with deduplicated and clustered indicators and all relevant columns.
+deduplicate_interactive <- function(
+    raw_df, frameworks, question_col,
+    similarity_start, min_cluster_size, max_rounds, false_positive_tag) {
+  # Initialization
+  df <- raw_df
+  df$QID <- seq_len(nrow(df))  # Unique identifier for each row/question
+  df$Raw_Indicator <- as.character(df[[question_col]])  # Preserve original question wording
+  df$Clean_Indicator <- vapply(df$Raw_Indicator, clean_question, character(1))  # Cleaned version for similarity
+  all_cluster_results <- list()  # Stores all results from each round
+  threshold <- similarity_start  # Set starting similarity threshold
+  round <- 1                    # Track the current round
+  
+  repeat {
+    # 1. Compute Embeddings and Similarity Matrix
+    cat(sprintf("\n[2/%d] Iteration %d: Computing embeddings and similarity (threshold=%.2f)...\n",
+                max_rounds + 2, round, threshold))
+    sim_mat <- embed_and_sim(df$Clean_Indicator)
+    
+    # 2. Hierarchical Clustering of Questions
+    #   - Convert similarity to distance (distance = 1 - similarity)
+    #   - Use average linkage clustering
+    #   - Assign clusters by cutting the tree at (1 - threshold)
+    question_dist <- as.dist(1 - sim_mat)
+    hclust_obj    <- stats::hclust(question_dist, method = "average")
+    clusters      <- stats::cutree(hclust_obj, h = 1 - threshold)
+    df$ClusterID  <- clusters
+    
+    # 3. Cluster Review: Interactive Per-Cluster Assignment
+    # For each cluster:
+    #   - If all indicators are identical (after cleaning), accept directly
+    #   - Otherwise, prompt user for a new global indicator, or to flag as FP
+    cluster_results <- list()
+    false_positives <- c()
+    cat(sprintf("[3/%d] Reviewing clusters (%d clusters found)...\n",
+                max_rounds + 2, length(unique(clusters))))
+    for (cl_id in sort(unique(clusters))) {
+      # Extract all rows/questions for this cluster
+      cluster_rows <- df[df$ClusterID == cl_id, ]
+      # Find unique cleaned indicators in this cluster
+      cluster_cleaned <- unique(cluster_rows$Clean_Indicator)
+      
+      # Framework membership for the current cluster
+      fw_vals <- get_frameworks(cluster_rows, frameworks)
+      
+      # 3a. All indicators in this cluster are identical: assign automatically
+      if (length(cluster_cleaned) == 1) {
+        global_indicator <- cluster_cleaned
+        cat(sprintf("  ✔️ Cluster %d: All indicators identical ('%s').\n", cl_id, global_indicator))
+      } else {
+        # 3b. User review: prompt for new global indicator or flag as FP
+        cat(sprintf("\n  ⚠️ Cluster %d has %d unique indicators:\n", cl_id, length(cluster_cleaned)))
+        cat(paste0("      ", seq_along(cluster_cleaned), ". ", cluster_cleaned, collapse = "\n"), "\n")
+        user_input <- readline(
+          prompt = sprintf("    → Enter new global indicator, or hit Enter to flag as FP [%s]: ", false_positive_tag)
+        )
+        if (user_input == "") user_input <- false_positive_tag
+        global_indicator <- user_input
+      }
+      
+      # Prepare a Details column that lists all raw indicators in this cluster (for traceability)
+      details <- paste(unique(cluster_rows$Raw_Indicator), collapse = "; ")
+      
+      # Store results for each member of the cluster
+      cluster_results[[as.character(cl_id)]] <- data.frame(
+        QID = cluster_rows$QID,
+        Raw_Indicator = cluster_rows$Raw_Indicator,
+        Clean_Indicator = cluster_rows$Clean_Indicator,
+        Topic = cluster_rows[["Climate change topic"]],
+        Subtopic = cluster_rows[["Subtopic"]],
+        ClusterID = cl_id,
+        Global_Indicator = global_indicator,
+        Details = details,
+        as.data.frame(as.list(fw_vals), stringsAsFactors = FALSE),
+        stringsAsFactors = FALSE
+      )
+      
+      # Track clusters flagged as "false positive" for possible reprocessing
+      if (global_indicator == false_positive_tag) false_positives <- c(false_positives, cl_id)
+    }
+    
+    # 4. Compile and Store This Round's Results
+    # Bind all cluster summaries for this round together, then save for later
+    cluster_results_df <- do.call(rbind, cluster_results)
+    all_cluster_results[[round]] <- cluster_results_df
+    
+    cat(sprintf("\n[4/%d] This round: %d clusters, %d flagged as FP.\n",
+                max_rounds + 2, length(unique(clusters)), length(false_positives)))
+    
+    # 5. Exit Conditions
+    if (length(false_positives) == 0) {
+      cat("✅ No false positive clusters flagged. Deduplication complete!\n")
+      break
+    }
+    if (round == max_rounds) {
+      cat("🛑 Max number of rounds reached. Stopping.\n")
+      break
+    }
+    
+    # 6. Prompt User for Next Threshold
+    cat("\n[5] Would you like to tighten the threshold to reprocess FPs?\n")
+    cat(sprintf("Current threshold is %.2f.\n", threshold))
+    user_choice <- readline("    (1) Use default increment (+0.05)\n    (2) Enter a custom value\n    (3) Stop now\nChoice [1/2/3]: ")
+    
+    if (user_choice == "3") {
+      cat("Exiting early per user choice.\n")
+      break
+    }
+    if (user_choice == "2") {
+      new_thresh <- as.numeric(readline("    Enter new threshold (0.00–1.00): "))
+      if (!is.na(new_thresh) && new_thresh > threshold && new_thresh < 1) {
+        threshold <- new_thresh
+      } else {
+        threshold <- min(threshold + 0.05, 0.99)
+      }
+    } else {
+      threshold <- min(threshold + 0.05, 0.99)
+    }
+    cat(sprintf("Threshold increased to %.2f for next round.\n", threshold))
+    
+    # 7. Filter: Only Reprocess Flagged Clusters
+    #   - Remove old cluster assignments and only retain rows that were in false positive clusters
+    cat(sprintf("    Reprocessing %d flagged clusters only...\n", length(false_positives)))
+    df <- df[df$ClusterID %in% false_positives, ]
+    df$ClusterID <- NULL
+    round <- round + 1
+  }
+  
+  # 8. Compile All Results and Return
+  # Combine all results, keeping only the *latest* cluster assignment for each QID
+  final_df <- do.call(rbind, all_cluster_results)
+  final_df <- final_df[!duplicated(final_df$QID, fromLast = TRUE), ]
+  final_df <- final_df[order(final_df$QID), ]
+  rownames(final_df) <- NULL
+  return(final_df)
+}
 
-# Apply cluster summary function to each cluster
-cluster_summaries <- do.call(
-  rbind, as.list(by(survey_with_clusters, 
-                    as.factor(survey_with_clusters$cluster),
-                    summarise_cluster_frameworks)))
-cluster_summaries[sort(cluster_summaries$Topic1, 
-                       cluster_summaries$Topic2, 
-                       cluster_summaries$Topic3, 
-                       cluster_summaries$Indicator), ]
 
-# Save cluster summaries
-write.csv(cluster_summaries, "clustered_questions.csv", row.names = FALSE)
+# Main --------------------------------------------------------------------
+raw_df <- as.data.frame(readxl::read_excel(file_path, sheet = excel_sheet))
+final_clusters <- deduplicate_interactive(
+  raw_df, frameworks, question_col, similarity_start, min_cluster_size, max_rounds, false_positive_tag
+)
+write.csv(final_clusters, file = "final_clusters_wide.csv", row.names = FALSE)
+cat("\n🎉 Deduplication complete! Results saved to final_clusters_wide.csv\n")
