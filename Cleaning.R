@@ -101,6 +101,6 @@ final_clusters <- clean_indicators(processed_df)
 
 # Enjoy the result
 cat("\n🎉 Cleaning complete! Results saved to clean_clusters.csv\n")
-# write.csv(final_clusters, file = paste0(format(Sys.time(), "%m%Y"), "_clean_clusters.csv"), row.names = FALSE)
+# write.csv(final_clusters, file = paste0(format(Sys.time(), "%Y%m"), "_clean_clusters.csv"), row.names = FALSE)
 
 
